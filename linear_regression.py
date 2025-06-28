@@ -1,10 +1,11 @@
 import pandas as pd
 import numpy as np
 from math import sqrt
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import Ridge
-from sklearn.feature_extraction import DictVectorizer
 
 # from readme we check the structure of u.data, u.item nd u.genre and we will combine them together 
 r_cols = ['user_id','movie_id','rating','timestamp']
@@ -26,188 +27,124 @@ R_tr      = train_df.pivot(index='user_id', columns='movie_id', values='rating')
 means_tr  = R_tr.mean(axis=1)
 R_tr_dm   = R_tr.sub(means_tr, axis=0)
 
-# --------------------  LINEAR REGRESSION WITH USER–GENRE INTERACTIONS --------------------
-# To give the linear model *personalised* variation across movies, we add user–genre interaction
-# features: a feature "ug_<user>_<genre>" is 1 when the movie belongs to <genre>.
-# The model is still linear, but far more expressive than just user & movie biases.
+#compute a low‑rank SVD of the mean‑centered TRAIN matrix (k latent factors)
+R_sparse = csr_matrix(R_tr_dm.values)
+K_FACTORS = 40  # dimensionality of latent space (tune 20‑100)
+U, S, Vt = svds(R_sparse, k=K_FACTORS)
 
-# helper: list of genre column names in the movies DataFrame
-GENRE_COLS = [col for col in movies.columns if col.startswith('genre_')]
+# convert to latent representations P (users) and Q (items)
+P = U @ np.diag(np.sqrt(S))          # shape (n_users, k)
+Q = (np.diag(np.sqrt(S)) @ Vt).T     # shape (n_items, k)
 
-# pre‑compute the genre indices present for every movie_id (speeds up prediction)
-movie_genres = {
-    row.movie_id: [g_idx for g_idx, gcol in enumerate(GENRE_COLS) if row[gcol] == 1]
-    for _, row in movies.iterrows()
-}
+# maps from ids to row/col indices
+user_to_idx = {u: i for i, u in enumerate(R_tr.index)}
+item_to_idx = {m: i for i, m in enumerate(R_tr.columns)}
 
-# build dict‑style feature representations for each training sample
-def make_feature_dict(u, m):
-    feats = {
-        f'u_{u}': 1,
-        f'm_{m}': 1,
-    }
-    for g in movie_genres[m]:
-        feats[f'ug_{u}_{g}'] = 1  # user‑genre interaction feature
-    return feats
+# build feature matrix [P_u | Q_i] for each training instance
+X_train = np.zeros((len(train_df), 2*K_FACTORS))
+for row_idx, (u, m) in enumerate(zip(train_df.user_id, train_df.movie_id)):
+    ui = user_to_idx[u]
+    mi = item_to_idx[m]
+    X_train[row_idx, :K_FACTORS]      = P[ui]
+    X_train[row_idx, K_FACTORS:] = Q[mi]
+y_train = train_df['rating'].values
 
-train_dicts = [make_feature_dict(r.user_id, r.movie_id) for _, r in train_df.iterrows()]
-vec = DictVectorizer()
-X_train = vec.fit_transform(train_dicts)
+# fit a ridge regressor on latent features
+ridge = Ridge(alpha=5.0, fit_intercept=True)  # alpha tuned lightly; grid‑search for best
+ridge.fit(X_train, y_train)
 
-y_train = train_df['rating']
-
-# ridge (L2‑regularised) regression to prevent over‑fitting on sparse data
-lin_reg = Ridge(alpha=2.0, fit_intercept=True)
-lin_reg.fit(X_train, y_train)
-
-# ----------  cache coefficients for fast scoring  ----------
-coef = lin_reg.coef_
-intercept = float(lin_reg.intercept_)
-
-user_coef, movie_coef, user_genre_coef = {}, {}, {}
-for idx, fname in enumerate(vec.get_feature_names_out()):
-    if fname.startswith('u_'):
-        user_coef[int(fname[2:])] = coef[idx]
-    elif fname.startswith('m_'):
-        movie_coef[int(fname[2:])] = coef[idx]
-    elif fname.startswith('ug_'):
-        _, uid, gid = fname.split('_')  # "ug_<user>_<genre>"
-        user_genre_coef[(int(uid), int(gid))] = coef[idx]
-
-# --------------------  PREDICT & RECOMMEND  --------------------
+intercept = float(ridge.intercept_)
+coef_user = ridge.coef_[:K_FACTORS]
+coef_item = ridge.coef_[K_FACTORS:]
 
 def predict_lr(u, m):
-    """Predict rating using user, movie and user‑genre coefficients."""
-    pred = intercept
-    pred += user_coef.get(u, 0.0)
-    pred += movie_coef.get(m, 0.0)
-    for g in movie_genres[m]:
-        pred += user_genre_coef.get((u, g), 0.0)
-    return float(np.clip(pred, 1, 5))
+    if u not in user_to_idx or m not in item_to_idx:
+        return 3.0  # default fallback
+    ui, mi = user_to_idx[u], item_to_idx[m]
+    pu, qi = P[ui], Q[mi]
+    return float(np.clip(intercept + pu.dot(coef_user) + qi.dot(coef_item), 1, 5))
 
-# RMSE on the held‑out test split
+# RMSE on held‑out test
 y_true, y_pred = [], []
 for _, row in test_df.iterrows():
     y_true.append(row.rating)
     y_pred.append(predict_lr(row.user_id, row.movie_id))
 rmse = sqrt(mean_squared_error(y_true, y_pred))
-print(f"Test RMSE (User–Genre Linear Regression): {rmse:.2f}")
+print(f"Test RMSE (Latent‑Factor Linear Regression): {rmse:.2f}")
 
-# --------------------  RECOMMEND FROM TRAIN (for evaluation) --------------------
 
 def recommend_from_train(u_id, K=10):
-    if u_id not in R_tr.index:
+    if u_id not in user_to_idx:
         raise ValueError("Unknown user in training data")
-
-    preds = np.full(R_tr.shape[1], intercept)
-    # add user bias once per movie
-    preds += user_coef.get(u_id, 0.0)
-    # add movie biases vectorised
-    preds += np.array([movie_coef.get(m, 0.0) for m in R_tr.columns])
-    # add user‑genre interactions (vectorised)
-    ug_contrib = np.zeros_like(preds)
-    for idx, m in enumerate(R_tr.columns):
-        for g in movie_genres[m]:
-            ug_contrib[idx] += user_genre_coef.get((u_id, g), 0.0)
-    preds += ug_contrib
-    preds = np.clip(preds, 1, 5)
-
-    already = R_tr.loc[u_id].values > 0  # mask TRAIN ratings only
-    preds[already] = -np.inf
-
-    top_idx = np.argpartition(-preds, K)[:K]
-    top_idx = top_idx[np.argsort(-preds[top_idx])]
+    ui = user_to_idx[u_id]
+    pu = P[ui]
+    raw_scores = intercept + pu.dot(coef_user) + Q.dot(coef_item)
+    raw_scores = np.clip(raw_scores, 1, 5)
+    already = R_tr.loc[u_id].values > 0
+    raw_scores[already] = -np.inf
+    top_idx = np.argpartition(-raw_scores, K)[:K]
+    top_idx = top_idx[np.argsort(-raw_scores[top_idx])]
     return R_tr.columns[top_idx]
 
-# helper metrics (unchanged)
-
-def ndcg_at_k(relevances, k):
-    dcg  = sum(rel / np.log2(idx + 2) for idx, rel in enumerate(relevances))
-    idcg = sum(1 / np.log2(idx + 2) for idx in range(min(sum(relevances), k)))
-    return dcg / idcg if idcg else 0.0
+def ndcg_at_k(rels, k):
+    dcg = sum(r / np.log2(i+2) for i, r in enumerate(rels))
+    idcg = sum(1 / np.log2(i+2) for i in range(min(sum(rels), k)))
+    return dcg / idcg if idcg else 0
 
 def apk(actual_set, pred_list, k):
-    hits = 0
-    sum_precisions = 0.0
-    for i, p in enumerate(pred_list[:k], start=1):
+    hits, s = 0, 0.0
+    for i, p in enumerate(pred_list[:k], 1):
         if p in actual_set:
             hits += 1
-            sum_precisions += hits / i
-    return sum_precisions / min(len(actual_set), k) if actual_set else 0.0
+            s += hits / i
+    return s / min(len(actual_set), k) if actual_set else 0
 
-# --------------------  RANKING METRICS EVALUATION  --------------------
-
-def evaluate_ranking_lr(k=10, threshold=4):
-    precisions, recalls, f1s, ndcgs, maps = [], [], [], [], []
-
-    for u in test_df['user_id'].unique():
-        true_items = set(test_df.loc[(test_df.user_id == u) & (test_df.rating >= threshold), 'movie_id'])
-        if not true_items:
+def evaluate_ranking(k=10, thr=4):
+    precs, recs, f1s, ndcgs, maps = [], [], [], [], []
+    for u in test_df.user_id.unique():
+        rel_items = set(test_df.loc[(test_df.user_id==u)&(test_df.rating>=thr),'movie_id'])
+        if not rel_items or u not in user_to_idx:
             continue
-        if u not in R_tr.index:
-            continue
+        ranked = recommend_from_train(u, k)
+        hits   = [1 if m in rel_items else 0 for m in ranked]
+        h      = sum(hits)
+        prec, rec = h/k, h/len(rel_items)
+        f1 = 2*prec*rec/(prec+rec) if prec+rec else 0
+        ndcg = ndcg_at_k(hits, k)
+        maps.append(apk(rel_items, ranked, k))
+        precs.append(prec); recs.append(rec); f1s.append(f1); ndcgs.append(ndcg)
+    return map(float, map(np.mean, [precs, recs, f1s, ndcgs, maps]))
 
-        ranked_items = recommend_from_train(u, k)
-        hits         = [1 if m in true_items else 0 for m in ranked_items]
-        num_hits     = sum(hits)
+p10, r10, f10, ndcg10, map10 = evaluate_ranking(10)
+print("\nRanking metrics @10 on test users (Latent‑Factor Linear Regression):")
+print(f"Precision@10: {p10:.4f}")
+print(f"Recall@10:    {r10:.4f}")
+print(f"F1@10:        {f10:.4f}")
+print(f"NDCG@10:      {ndcg10:.4f}")
+print(f"MAP@10:       {map10:.4f}\n")
 
-        prec = num_hits / k
-        rec  = num_hits / len(true_items)
-        f1   = 2*prec*rec/(prec+rec) if (prec+rec) else 0.0
-        ndcg_val = ndcg_at_k(hits, k)
-        map_val  = apk(true_items, ranked_items, k)
+# For deployment we retrain SVD on all data and reuse the same ridge weights.
+U_full, S_full, Vt_full = svds(csr_matrix(R_dm.values), k=K_FACTORS)
+P_full = U_full @ np.diag(np.sqrt(S_full))
+Q_full = (np.diag(np.sqrt(S_full)) @ Vt_full).T
 
-        precisions.append(prec)
-        recalls.append(rec)
-        f1s.append(f1)
-        ndcgs.append(ndcg_val)
-        maps.append(map_val)
+user_to_idx_full = {u: i for i, u in enumerate(R.index)}
 
-    return (
-        float(np.mean(precisions)),
-        float(np.mean(recalls)),
-        float(np.mean(f1s)),
-        float(np.mean(ndcgs)),
-        float(np.mean(maps))
-    )
-
-mean_prec, mean_rec, mean_f1, mean_ndcg, mean_map = evaluate_ranking_lr(k=10)
-print(f"\nRanking metrics @10 on test users (User–Genre Linear Regression):")
-print(f"Precision@10: {mean_prec:.4f}")
-print(f"Recall@10:    {mean_rec:.4f}")
-print(f"F1@10:        {mean_f1:.4f}")
-print(f"NDCG@10:      {mean_ndcg:.4f}")
-print(f"MAP@10:       {mean_map:.4f}\n")
-
-# --------------------  FULL‑DATA RECOMMENDER FOR DEMO  --------------------
 
 def recommend(u_id, n=5):
-    if u_id not in R.index:
+    if u_id not in user_to_idx_full:
         raise ValueError("Unknown user")
-
-    preds = np.full(R.shape[1], intercept)
-    preds += user_coef.get(u_id, 0.0)
-    preds += np.array([movie_coef.get(m, 0.0) for m in R.columns])
-    ug_contrib = np.zeros_like(preds)
-    for idx, m in enumerate(R.columns):
-        for g in movie_genres[m]:
-            ug_contrib[idx] += user_genre_coef.get((u_id, g), 0.0)
-    preds += ug_contrib
-    preds = np.clip(preds, 1, 5)
-
+    ui = user_to_idx_full[u_id]
+    pu = P_full[ui]
+    scores = intercept + pu.dot(coef_user) + Q_full.dot(coef_item)
+    scores = np.clip(scores, 1, 5)
     already = R.loc[u_id].values > 0
-    preds[already] = -np.inf
+    scores[already] = -np.inf
+    top = np.argpartition(-scores, n)[:n]
+    top = top[np.argsort(-scores[top])]
+    return [(movies.loc[movies.movie_id==R.columns[i],'title'].iloc[0], scores[i]) for i in top]
 
-    top_ids = np.argpartition(-preds, n)[:n]
-    top_ids = top_ids[np.argsort(-preds[top_ids])]
-
-    return [
-        (movies.loc[movies.movie_id == R.columns[idx], 'title'].iloc[0], preds[idx])
-        for idx in top_ids
-    ]
-
-# --------------------  EXAMPLE  --------------------
-print("Top 5 recommendations for user 10 (demo – user–genre linear model):")
-for title, score in recommend(10, 5):
-    print(f"{title} (predicted rating: {score:.2f})")
+print("Top 5 recommendations for user 10 (latent‑factor model):")
+for t,s in recommend(10,5):
+    print(f"{t} (pred: {s:.2f})")
 

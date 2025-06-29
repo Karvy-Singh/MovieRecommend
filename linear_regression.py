@@ -1,150 +1,133 @@
-import pandas as pd
+from pathlib import Path
+from typing import List, Tuple, Dict
+from collections import defaultdict
+
 import numpy as np
-from math import sqrt
-from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import svds
+import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, ndcg_score
 
-# from readme we check the structure of u.data, u.item nd u.genre and we will combine them together 
-r_cols = ['user_id','movie_id','rating','timestamp']
-ratings = pd.read_csv('ml-100k/u.data', sep='\t', names=r_cols) # now ratings is a dataframe with the names of columns as r_cols
-i_cols = ['movie_id','title','release_date','video_release_date','IMDb_URL'] \
-       + [f'genre_{i}' for i in range(19)]
-movies = pd.read_csv('ml-100k/u.item', sep='|', names=i_cols, encoding='latin-1') #this gets the data of title and genre as asked and make a dataframe of the same
-data = pd.merge(ratings, movies[['movie_id','title']], on='movie_id') #this will merge the two datasets on basis of movie_id
+RATING_THRESHOLD  = 4          # ≥ threshold ⇒ *relevant* (for Precision/Recall/MAP/F1)
+TOP_K_NEIGHBOURS  = 50         # number of neighbours fed to the regression
+DEFAULT_FILL      = 0          # value for unrated cells in the user‑item matrix
+TEST_SIZE         = 0.20       # fraction of each user’s ratings withheld for testing
 
-# we now make a matrix as asked so that it can be used for recommendations ahead
-R     = data.pivot(index='user_id', columns='movie_id', values='rating').fillna(0) 
-means = R.mean(axis=1)
-R_dm  = R.sub(means, axis=0) #normalization
-
-# using the mentioned method of train_test_split from sklearn 
-train_df, test_df = train_test_split(data, test_size=0.2, random_state=42)
-#process repeat for training dataset
-R_tr      = train_df.pivot(index='user_id', columns='movie_id', values='rating').fillna(0)
-means_tr  = R_tr.mean(axis=1)
-R_tr_dm   = R_tr.sub(means_tr, axis=0)
-
-#compute a low‑rank SVD of the mean‑centered TRAIN matrix (k latent factors)
-R_sparse = csr_matrix(R_tr_dm.values)
-K_FACTORS = 40  # dimensionality of latent space (tune 20‑100)
-U, S, Vt = svds(R_sparse, k=K_FACTORS)
-
-# convert to latent representations P (users) and Q (items)
-P = U @ np.diag(np.sqrt(S))          # shape (n_users, k)
-Q = (np.diag(np.sqrt(S)) @ Vt).T     # shape (n_items, k)
-
-# maps from ids to row/col indices
-user_to_idx = {u: i for i, u in enumerate(R_tr.index)}
-item_to_idx = {m: i for i, m in enumerate(R_tr.columns)}
-
-# build feature matrix [P_u | Q_i] for each training instance
-X_train = np.zeros((len(train_df), 2*K_FACTORS))
-for row_idx, (u, m) in enumerate(zip(train_df.user_id, train_df.movie_id)):
-    ui = user_to_idx[u]
-    mi = item_to_idx[m]
-    X_train[row_idx, :K_FACTORS]      = P[ui]
-    X_train[row_idx, K_FACTORS:] = Q[mi]
-y_train = train_df['rating'].values
-
-# fit a ridge regressor on latent features
-ridge = Ridge(alpha=5.0, fit_intercept=True)  # alpha tuned lightly; grid‑search for best
-ridge.fit(X_train, y_train)
-
-intercept = float(ridge.intercept_)
-coef_user = ridge.coef_[:K_FACTORS]
-coef_item = ridge.coef_[K_FACTORS:]
-
-def predict_lr(u, m):
-    if u not in user_to_idx or m not in item_to_idx:
-        return 3.0  # default fallback
-    ui, mi = user_to_idx[u], item_to_idx[m]
-    pu, qi = P[ui], Q[mi]
-    return float(np.clip(intercept + pu.dot(coef_user) + qi.dot(coef_item), 1, 5))
-
-# RMSE on held‑out test
-y_true, y_pred = [], []
-for _, row in test_df.iterrows():
-    y_true.append(row.rating)
-    y_pred.append(predict_lr(row.user_id, row.movie_id))
-rmse = sqrt(mean_squared_error(y_true, y_pred))
-print(f"Test RMSE (Latent‑Factor Linear Regression): {rmse:.2f}")
+def load_movielens_100k(path: str | Path = "ml-100k") -> tuple[pd.DataFrame, pd.DataFrame]:
+    path = Path(path)
+    ratings = pd.read_csv(path / "u.data", sep="\t", names=["user_id", "movie_id", "rating", "timestamp"], engine="python")
+    movies  = pd.read_csv(path / "u.item", sep="|", encoding="latin-1", engine="python",
+                          names=["movie_id", "title", "release_date", "video_release_date", "imdb_url"] + [f"genre_{i}" for i in range(19)])
+    return ratings, movies[["movie_id", "title"]]
 
 
-def recommend_from_train(u_id, K=10):
-    if u_id not in user_to_idx:
-        raise ValueError("Unknown user in training data")
-    ui = user_to_idx[u_id]
-    pu = P[ui]
-    raw_scores = intercept + pu.dot(coef_user) + Q.dot(coef_item)
-    raw_scores = np.clip(raw_scores, 1, 5)
-    already = R_tr.loc[u_id].values > 0
-    raw_scores[already] = -np.inf
-    top_idx = np.argpartition(-raw_scores, K)[:K]
-    top_idx = top_idx[np.argsort(-raw_scores[top_idx])]
-    return R_tr.columns[top_idx]
-
-def ndcg_at_k(rels, k):
-    dcg = sum(r / np.log2(i+2) for i, r in enumerate(rels))
-    idcg = sum(1 / np.log2(i+2) for i in range(min(sum(rels), k)))
-    return dcg / idcg if idcg else 0
-
-def apk(actual_set, pred_list, k):
-    hits, s = 0, 0.0
-    for i, p in enumerate(pred_list[:k], 1):
-        if p in actual_set:
-            hits += 1
-            s += hits / i
-    return s / min(len(actual_set), k) if actual_set else 0
-
-def evaluate_ranking(k=10, thr=4):
-    precs, recs, f1s, ndcgs, maps = [], [], [], [], []
-    for u in test_df.user_id.unique():
-        rel_items = set(test_df.loc[(test_df.user_id==u)&(test_df.rating>=thr),'movie_id'])
-        if not rel_items or u not in user_to_idx:
-            continue
-        ranked = recommend_from_train(u, k)
-        hits   = [1 if m in rel_items else 0 for m in ranked]
-        h      = sum(hits)
-        prec, rec = h/k, h/len(rel_items)
-        f1 = 2*prec*rec/(prec+rec) if prec+rec else 0
-        ndcg = ndcg_at_k(hits, k)
-        maps.append(apk(rel_items, ranked, k))
-        precs.append(prec); recs.append(rec); f1s.append(f1); ndcgs.append(ndcg)
-    return map(float, map(np.mean, [precs, recs, f1s, ndcgs, maps]))
-
-p10, r10, f10, ndcg10, map10 = evaluate_ranking(10)
-print("\nRanking metrics @10 on test users (Latent‑Factor Linear Regression):")
-print(f"Precision@10: {p10:.4f}")
-print(f"Recall@10:    {r10:.4f}")
-print(f"F1@10:        {f10:.4f}")
-print(f"NDCG@10:      {ndcg10:.4f}")
-print(f"MAP@10:       {map10:.4f}\n")
-
-# For deployment we retrain SVD on all data and reuse the same ridge weights.
-U_full, S_full, Vt_full = svds(csr_matrix(R_dm.values), k=K_FACTORS)
-P_full = U_full @ np.diag(np.sqrt(S_full))
-Q_full = (np.diag(np.sqrt(S_full)) @ Vt_full).T
-
-user_to_idx_full = {u: i for i, u in enumerate(R.index)}
+def build_user_item_matrix(ratings: pd.DataFrame, fill: int | float = DEFAULT_FILL) -> pd.DataFrame:
+    """Pivot ratings into a user × item table filled with fill."""
+    return ratings.pivot(index="user_id", columns="movie_id", values="rating").fillna(fill)
 
 
-def recommend(u_id, n=5):
-    if u_id not in user_to_idx_full:
-        raise ValueError("Unknown user")
-    ui = user_to_idx_full[u_id]
-    pu = P_full[ui]
-    scores = intercept + pu.dot(coef_user) + Q_full.dot(coef_item)
-    scores = np.clip(scores, 1, 5)
-    already = R.loc[u_id].values > 0
-    scores[already] = -np.inf
-    top = np.argpartition(-scores, n)[:n]
-    top = top[np.argsort(-scores[top])]
-    return [(movies.loc[movies.movie_id==R.columns[i],'title'].iloc[0], scores[i]) for i in top]
+def mean_centre(matrix: pd.DataFrame) -> pd.DataFrame:
+    """Return a matrix where every user’s non‑zero ratings have her mean subtracted."""
+    user_means = matrix.replace(0, np.nan).mean(axis=1)
+    return matrix.sub(user_means, axis=0).fillna(0)
 
-print("Top 5 recommendations for user 10 (latent‑factor model):")
-for t,s in recommend(10,5):
-    print(f"{t} (pred: {s:.2f})")
+def split_user_ratings(user_row: pd.Series, test_size: float = TEST_SIZE, seed: int = 42) -> Tuple[List[int], List[int]]:
+    rated_items = user_row[user_row > 0].index.tolist()
+    return train_test_split(rated_items, test_size=test_size, random_state=seed)
+
+def cosine(u: np.ndarray, v: np.ndarray) -> float:
+    mask = (u != 0) | (v != 0)
+    if not mask.any():
+        return 0.0
+    num   = np.dot(u[mask], v[mask])
+    denom = np.linalg.norm(u[mask]) * np.linalg.norm(v[mask])
+    return num / denom if denom else 0.0
+
+
+def top_neighbours(target_vector: pd.Series, matrix_norm: pd.DataFrame, k: int = TOP_K_NEIGHBOURS) -> List[int]:
+    sims = [(uid, cosine(target_vector.values, row.values))
+            for uid, row in matrix_norm.iterrows() if uid != target_vector.name]
+    sims.sort(key=lambda t: t[1], reverse=True)
+    return [uid for uid, sim in sims[:k] if sim > 0]
+
+
+def fit_lr(neighbours: List[int], matrix_norm: pd.DataFrame, uid: int, train_items: List[int]) -> LinearRegression:
+    X = matrix_norm.loc[neighbours, train_items].T.values  # (n_items, n_neigh)
+    y = matrix_norm.loc[uid, train_items].values           # (n_items,)
+    return LinearRegression().fit(X, y)
+
+def predict_centered(model: LinearRegression, neighbours: List[int], matrix_norm: pd.DataFrame, items: List[int]) -> pd.Series:
+    X = matrix_norm.loc[neighbours, items].T.values
+    return pd.Series(model.predict(X), index=items)
+
+
+def recommend(user_id: int, user_item: pd.DataFrame, user_item_norm: pd.DataFrame, movies: pd.DataFrame,
+              n_recs: int = 5, k_neigh: int = TOP_K_NEIGHBOURS, verbose: bool = False) -> Tuple[List[str], Dict[str, float]]:
+    #Hold‑out split for this user
+    train_items, test_items = split_user_ratings(user_item.loc[user_id])
+
+    # Neighbour selection + regression 
+    neigh_ids = top_neighbours(user_item_norm.loc[user_id], user_item_norm, k=k_neigh)
+    if not neigh_ids:
+        raise RuntimeError("No suitable neighbours – try increasing TOP_K_NEIGHBOURS.")
+    model = fit_lr(neigh_ids, user_item_norm, user_id, train_items)
+
+    # Score all unseen items
+    unseen = user_item.columns.difference(train_items + test_items)
+    preds_centered = predict_centered(model, neigh_ids, user_item_norm, unseen)
+    topN_ids = preds_centered.sort_values(ascending=False).head(n_recs).index.tolist()
+    titles = movies.set_index("movie_id").loc[topN_ids, "title"].tolist()
+
+    # Evaluation
+    user_mean = user_item.replace(0, np.nan).loc[user_id].mean()
+
+    # RMSE on centred ratings
+    y_true_c = user_item_norm.loc[user_id, test_items]
+    y_pred_c = predict_centered(model, neigh_ids, user_item_norm, test_items)
+    rmse = mean_squared_error(y_true_c, y_pred_c)
+
+    # Ranking metrics use raw (positive) ratings
+    y_true_raw = user_item.loc[user_id, test_items]
+    y_pred_raw = y_pred_c + user_mean
+    ndcg = ndcg_score([y_true_raw.values], [y_pred_raw.values])
+
+    # Binary relevance for P@K, R@K, MAP, F1
+    relevant = [i for i in test_items if user_item.loc[user_id, i] >= RATING_THRESHOLD]
+    rank_order = y_pred_raw.sort_values(ascending=False).index.tolist()
+    k = n_recs
+    hits = [1 if itm in relevant else 0 for itm in rank_order[:k]]
+    precision = sum(hits) / k if k else 0
+    recall    = sum(hits) / len(relevant) if relevant else 0
+    f1 = (2*precision*recall) / (precision + recall) if (precision + recall) else 0
+    # MAP@k
+    ap, hit_cnt = 0.0, 0
+    for idx, itm in enumerate(rank_order[:k], start=1):
+        if itm in relevant:
+            hit_cnt += 1
+            ap += hit_cnt / idx
+    map_k = ap / len(relevant) if relevant else 0
+
+    metrics = dict(RMSE=rmse, Precision_at_k=precision, Recall_at_k=recall, F1=f1, nDCG=ndcg, MAP=map_k)
+
+    if verbose:
+        print(f"\nRecommendations for user U{user_id} (top {n_recs}):")
+        for t in titles:
+            print(f"  • {t}")
+        print("\nMetrics:")
+        for k_, v_ in metrics.items():
+            print(f"  {k_:14s}: {v_: .4f}")
+
+    return titles, metrics
+
+def demo(user_id: int = 10, n_recs: int = 5):
+    ratings, movies = load_movielens_100k()
+    ui  = build_user_item_matrix(ratings)
+    uin = mean_centre(ui)
+    return recommend(user_id, ui, uin, movies, n_recs=n_recs, verbose=True)
+
+if __name__ == "__main__":
+    import sys
+    uid  = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+    nrec = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    demo(uid, nrec)
 

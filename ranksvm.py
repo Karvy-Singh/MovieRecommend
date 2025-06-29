@@ -1,31 +1,3 @@
-"""
-MovieLens‑100k RankSVM Recommender
-=================================
-
-A neighbourhood–based recommender that uses **RankSVM** (Joachims, 2002) to
-learn an optimal linear scoring function from pairwise preferences of the
-target user.  Concretely, we:
-
-1. Build the usual *user × item* matrix and mean‑centre each user’s ratings.
-2. For the test user, pick the **K most similar neighbours** (cosine).
-3. For every *training* pair of items where the user prefers *i ≻ j* we add a
-   training example `x = r_neigh(i) − r_neigh(j)` with label +1;
-   if *j ≻ i* we flip the sign and use label −1.
-4. Fit a **LinearSVC** (hinge loss) without intercept – this is RankSVM.
-5. Score any item with the learnt weight vector: `score(k) = w · r_neigh(k)`.
-6. Recommend top‑N unseen titles and report RMSE, Precision@K, Recall@K, F1,
-   MAP and nDCG (computed on raw ratings).
-
-Usage
------
-```bash
-python movie_recommender_ranksvm.py            # demo for user 10, 5 recs
-python movie_recommender_ranksvm.py 42 10      # user 42, top‑10
-```
-You can also `import movie_recommender_ranksvm as rr; rr.demo(uid, n)`.
-"""
-from __future__ import annotations
-
 from pathlib import Path
 from typing import List, Tuple, Dict
 from itertools import combinations
@@ -36,14 +8,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.svm import LinearSVC
 from sklearn.metrics import mean_squared_error, ndcg_score
 
-# ───────────────────────────────────────── Config ─────────────────────────────────────────────
 RATING_THRESHOLD  = 4      # relevant if rating ≥ threshold
 TOP_K_NEIGHBOURS  = 50     # number of neighbours for RankSVM features
 DEFAULT_FILL      = 0      # filler for missing ratings
 TEST_SIZE         = 0.20   # per‑user hold‑out share
 C_PARAM           = 1.0    # SVM regularisation
-
-# ╔════════════════════════ 1. Data Loading & Pre‑processing ═════════════════════════╗
 
 def load_movielens_100k(path: str | Path = "ml-100k") -> tuple[pd.DataFrame, pd.DataFrame]:
     path = Path(path)
@@ -62,12 +31,9 @@ def mean_centre(matrix: pd.DataFrame) -> pd.DataFrame:
     means = matrix.replace(0, np.nan).mean(axis=1)
     return matrix.sub(means, axis=0).fillna(0)
 
-# ╔════════════════════════ 2. Utilities: split, similarity, neighbours ════════════════════════╗
-
 def split_user_ratings(user_row: pd.Series, test_size: float = TEST_SIZE, seed: int = 42) -> Tuple[List[int], List[int]]:
     items = user_row[user_row > 0].index.tolist()
     return train_test_split(items, test_size=test_size, random_state=seed)
-
 
 def cosine(u: np.ndarray, v: np.ndarray) -> float:
     mask = (u != 0) | (v != 0)
@@ -84,17 +50,15 @@ def top_neighbours(target: pd.Series, norm_matrix: pd.DataFrame, k: int = TOP_K_
     sims.sort(key=lambda p: p[1], reverse=True)
     return [uid for uid,sim in sims[:k] if sim > 0]
 
-# ╔════════════════════════ 3. RankSVM Training & Prediction ════════════════════════════════╗
-
 def _make_pairwise_dataset(uid: int, train_items: List[int], neigh_ids: List[int],
                            ui_norm: pd.DataFrame, ui_raw: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Return feature matrix *X* and label vector *y* for RankSVM.
+    """Return feature matrix X and label vector *y* for RankSVM.
 
     For each ordered pair (i, j) with different user ratings we create:
        x = r_neigh(i) − r_neigh(j)
        y =  +1   if user prefers i ≻ j
             −1   if j ≻ i
-    This keeps **both** classes, satisfying LinearSVC’s requirement.
+    This keeps both classes, satisfying LinearSVC’s requirement.
     """
     X, y = [], []
     for i, j in combinations(train_items, 2):
@@ -125,8 +89,6 @@ def predict_centered(model: LinearSVC, neigh_ids: List[int], ui_norm: pd.DataFra
     scores = model.decision_function(X)
     return pd.Series(scores, index=items)
 
-# ╔══════════════════════ 4. Recommendation & Evaluation ═════════════════════════════════════╗
-
 def recommend(user_id: int, ui: pd.DataFrame, uin: pd.DataFrame, movies: pd.DataFrame,
               n_recs: int = 5, k_neigh: int = TOP_K_NEIGHBOURS, verbose: bool = False) -> Tuple[List[str], Dict[str,float]]:
     train_items, test_items = split_user_ratings(ui.loc[user_id])
@@ -142,7 +104,6 @@ def recommend(user_id: int, ui: pd.DataFrame, uin: pd.DataFrame, movies: pd.Data
     top_ids = preds_c.nlargest(n_recs).index.tolist()
     titles = movies.set_index("movie_id").loc[top_ids, "title"].tolist()
 
-    # ── Metrics ──────────────────────────────────────────────────────────────
     user_mean = ui.replace(0, np.nan).loc[user_id].mean()
     y_true_c = uin.loc[user_id, test_items]
     y_pred_c = predict_centered(model, neigh, uin, test_items)
@@ -178,15 +139,12 @@ def recommend(user_id: int, ui: pd.DataFrame, uin: pd.DataFrame, movies: pd.Data
 
     return titles, metrics
 
-# ╔══════════════════════ 5. Demo Helper ══════════════════════════════════════════════════════╗
-
 def demo(user_id: int = 10, n_recs: int = 5):
     ratings, movies = load_movielens_100k()
     ui  = build_user_item_matrix(ratings)
     uin = mean_centre(ui)
     return recommend(user_id, ui, uin, movies, n_recs=n_recs, verbose=True)
 
-# ╔══════════════════════ 6. CLI entry point ═════════════════════════════════════════════════╗
 if __name__ == "__main__":
     import sys
     uid  = int(sys.argv[1]) if len(sys.argv) > 1 else 10
